@@ -1,0 +1,23 @@
+# Environment variables
+.env
+
+# OAuth credentials - NEVER commit these!
+client_secret.json
+client_secret*.json
+token.pickle
+
+# Backup files (contain your video data)
+description_backups.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/

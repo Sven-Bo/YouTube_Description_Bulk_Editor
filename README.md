@@ -37,18 +37,3 @@ python youtube_description_editor_gui.py
 2. Enter text to **Find** and **Replace with**
 3. Click **Search** to find matching videos
 4. Select videos and click **Update Selected**
-
-## API Quota
-
-YouTube API has a daily limit of 10,000 units. This tool is optimized to use minimal quota:
-- Fetches 50 videos per API call
-- ~5 calls for 200 videos
-
-If you hit the limit, create a new Google Cloud project for fresh quota.
-
-## Security
-
-The `.gitignore` excludes sensitive files:
-- `client_secret.json` - Your API credentials
-- `token.pickle` - Your auth token
-- `description_backups.json` - Your video backups

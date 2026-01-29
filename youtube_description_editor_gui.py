@@ -21,11 +21,16 @@ import re
 import pickle
 import threading
 import json
+import urllib.request
+import urllib.error
 from datetime import datetime
 from pathlib import Path
 
 import FreeSimpleGUI as sg
 from dotenv import load_dotenv
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -214,6 +219,135 @@ def restore_from_backup(youtube_api, video_id):
 # Pattern Processing Functions
 # =============================================================================
 
+# URL status cache to avoid rechecking the same URLs
+_url_cache = {}
+
+
+def extract_urls(text):
+    """Extract all URLs from text."""
+    url_pattern = r'https?://[^\s<>"\')\]]+[^\s<>"\')\].,;:!?]'
+    urls = re.findall(url_pattern, text)
+    return urls
+
+
+def check_url_status(url, timeout=15, use_cache=True):
+    """
+    Check if a URL is accessible.
+    Returns: (status_code, error_message or None, from_cache)
+    """
+    # Check cache first
+    if use_cache and url in _url_cache:
+        status, error = _url_cache[url]
+        return status, error, True
+    
+    try:
+        # Use more complete browser headers to avoid being blocked
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+        }
+        req = urllib.request.Request(url, headers=headers, method='HEAD')
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            result = (response.getcode(), None)
+    except urllib.error.HTTPError as e:
+        # Some sites block HEAD, try GET
+        if e.code == 405:
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=timeout) as response:
+                    result = (response.getcode(), None)
+            except urllib.error.HTTPError as e2:
+                result = (e2.code, str(e2.reason))
+            except Exception as e2:
+                result = (None, str(e2))
+        else:
+            result = (e.code, str(e.reason))
+    except urllib.error.URLError as e:
+        result = (None, str(e.reason))
+    except Exception as e:
+        result = (None, str(e))
+    
+    # Cache the result
+    _url_cache[url] = result
+    return result[0], result[1], False
+
+
+def export_all_links_to_excel(videos_with_links, filename=None):
+    """
+    Export ALL links report to Excel file with status and video privacy.
+    Returns the filename of the created file.
+    """
+    if filename is None:
+        filename = f"links_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "All Links Report"
+    
+    # Header styles
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    broken_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    ok_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    
+    # Headers
+    headers = ["Video Title", "Video URL", "Privacy", "Link in Description", "Status", "Status Code", "Error"]
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+    
+    # Data rows
+    row = 2
+    for video in videos_with_links:
+        video_title = video["title"]
+        video_url = f"https://www.youtube.com/watch?v={video['id']}"
+        privacy = video.get("privacy", "Unknown")
+        
+        for url, status_code, error in video.get("all_links", []):
+            ws.cell(row=row, column=1, value=video_title)
+            ws.cell(row=row, column=2, value=video_url)
+            ws.cell(row=row, column=3, value=privacy)
+            ws.cell(row=row, column=4, value=url)
+            
+            # Determine status
+            if status_code is not None and status_code < 400:
+                status = "OK"
+                fill = ok_fill
+            else:
+                status = "Broken"
+                fill = broken_fill
+            
+            ws.cell(row=row, column=5, value=status)
+            ws.cell(row=row, column=6, value=status_code if status_code else "Unreachable")
+            ws.cell(row=row, column=7, value=error or "")
+            
+            # Apply fill to status column
+            ws.cell(row=row, column=5).fill = fill
+            
+            row += 1
+    
+    # Auto-adjust column widths
+    for col in range(1, 8):
+        max_length = len(headers[col-1])
+        for r in range(2, row):
+            cell_value = ws.cell(row=r, column=col).value
+            if cell_value:
+                max_length = max(max_length, min(len(str(cell_value)), 60))
+        ws.column_dimensions[get_column_letter(col)].width = max_length + 2
+    
+    # Freeze header row and add auto-filter
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:G{row-1}"
+    
+    wb.save(filename)
+    return filename
+
+
 def check_video_needs_update(description, find_pattern):
     """
     Check if a video description contains the find pattern.
@@ -252,6 +386,7 @@ class YouTubeDescriptionEditorGUI:
         self.window = None
         self.find_pattern = ""
         self.replace_with = ""
+        self._link_check_result = None  # For thread-safe popup handling
 
         # Set theme
         sg.theme("DarkBlue13")
@@ -313,6 +448,7 @@ class YouTubeDescriptionEditorGUI:
             [
                 sg.Button("🔐 Connect", key="-CONNECT-", size=(12, 1)),
                 sg.Button("🔍 Search", key="-SEARCH-", size=(10, 1), disabled=True),
+                sg.Button("🔗 Check 404 Links", key="-CHECK_LINKS-", size=(14, 1), disabled=True),
                 sg.Button("✏️ Update Selected", key="-UPDATE-", size=(15, 1), disabled=True),
                 sg.Button("🔄 Restore Backup", key="-RESTORE-", size=(15, 1), disabled=True),
                 sg.Button("❌ Exit", key="-EXIT-", size=(8, 1))
@@ -329,15 +465,13 @@ class YouTubeDescriptionEditorGUI:
             [sg.Column(video_list_column), sg.VerticalSeparator(), sg.Column(preview_column)]
         ]
 
-        # Main layout
+        # Main layout - compact with no extra spacing
         layout = [
-            [sg.Text("🎬 YouTube Bulk Description Editor", font=("Helvetica", 16, "bold"))],
+            [sg.Text("🎬 YouTube Bulk Description Editor", font=("Helvetica", 14, "bold")), sg.Push(), *button_row[0]],
             [sg.HorizontalSeparator()],
             [sg.Column(left_column, vertical_alignment="top"), sg.VerticalSeparator(), sg.Column(right_column, vertical_alignment="top")],
             [sg.HorizontalSeparator()],
             *status_row,
-            [sg.HorizontalSeparator()],
-            *button_row
         ]
 
         return sg.Window(
@@ -345,7 +479,7 @@ class YouTubeDescriptionEditorGUI:
             layout,
             finalize=True,
             resizable=True,
-            size=(1400, 750)
+            size=(1400, 600)
         )
 
     def update_status(self, message):
@@ -376,6 +510,7 @@ class YouTubeDescriptionEditorGUI:
             self.youtube_api.authenticate()
             self.update_status("✅ Connected to YouTube successfully!")
             self.window["-SEARCH-"].update(disabled=False)
+            self.window["-CHECK_LINKS-"].update(disabled=False)
             self.window["-CONNECT-"].update(disabled=True)
             return True
         except FileNotFoundError as e:
@@ -493,10 +628,138 @@ class YouTubeDescriptionEditorGUI:
         if 0 <= row_index < len(self.videos_needing_update):
             video = self.videos_needing_update[row_index]
             current_desc = video["details"]["snippet"]["description"]
-            new_desc, _, _ = process_description(current_desc, self.find_pattern, self.replace_with)
+            
+            # Check if this is a broken links result (has broken_links key)
+            if "broken_links" in video:
+                # Show broken links info in the "After Update" tab
+                broken_info = "🔗 BROKEN LINKS FOUND:\n\n"
+                for url, status, error in video["broken_links"]:
+                    status_str = str(status) if status else "Unreachable"
+                    broken_info += f"❌ [{status_str}] {url}\n   Error: {error}\n\n"
+                self.window["-PREVIEW_CURRENT-"].update(current_desc)
+                self.window["-PREVIEW_NEW-"].update(broken_info)
+            else:
+                new_desc, _, _ = process_description(current_desc, self.find_pattern, self.replace_with)
+                self.window["-PREVIEW_CURRENT-"].update(current_desc)
+                self.window["-PREVIEW_NEW-"].update(new_desc)
 
-            self.window["-PREVIEW_CURRENT-"].update(current_desc)
-            self.window["-PREVIEW_NEW-"].update(new_desc)
+    def check_broken_links(self):
+        """Check all videos for links and export full report."""
+        self.update_status("Fetching videos from channel...")
+        self.show_progress(True)
+
+        try:
+            # Get all videos
+            self.videos = self.youtube_api.get_all_videos(
+                progress_callback=lambda count: self.update_progress(count, count, "Fetching video list")
+            )
+
+            if not self.videos:
+                self.update_status("No videos found on channel")
+                self.show_progress(False)
+                return
+
+            # Fetch video details in batches and check links
+            self.videos_needing_update = []
+            all_videos_with_links = []  # For full Excel export
+            total = len(self.videos)
+            batch_size = 50
+            total_links_checked = 0
+            cached_links = 0
+            broken_count = 0
+
+            for batch_start in range(0, total, batch_size):
+                batch_end = min(batch_start + batch_size, total)
+                batch_ids = [v["id"] for v in self.videos[batch_start:batch_end]]
+                
+                self.update_progress(batch_end, total, "Fetching video details")
+
+                details_batch = self.youtube_api.get_video_details_batch(batch_ids)
+
+                for video in self.videos[batch_start:batch_end]:
+                    video_details = details_batch.get(video["id"])
+                    if not video_details:
+                        continue
+
+                    description = video_details["snippet"]["description"]
+                    urls = extract_urls(description)
+                    
+                    # Get privacy status
+                    privacy_status = video_details.get("status", {}).get("privacyStatus", "Unknown")
+                    
+                    if not urls:
+                        continue
+
+                    # Check each URL (with caching)
+                    all_links = []
+                    broken_links = []
+                    for url in urls:
+                        total_links_checked += 1
+                        status_code, error, from_cache = check_url_status(url)
+                        
+                        if from_cache:
+                            cached_links += 1
+                            self.update_status(f"Link {total_links_checked} (cached): {url[:40]}...")
+                        else:
+                            self.update_status(f"Checking link {total_links_checked}: {url[:40]}...")
+                        
+                        # Store ALL links
+                        all_links.append((url, status_code, error))
+                        
+                        if status_code is None or status_code >= 400:
+                            broken_links.append((url, status_code, error))
+                            broken_count += 1
+
+                    # Add to full export list (all videos with links)
+                    all_videos_with_links.append({
+                        "id": video["id"],
+                        "title": video["title"],
+                        "privacy": privacy_status,
+                        "all_links": all_links,
+                        "broken_links": broken_links
+                    })
+
+                    # Add to GUI list only if has broken links
+                    if broken_links:
+                        self.videos_needing_update.append({
+                            "id": video["id"],
+                            "title": video["title"],
+                            "issues": [f"{len(broken_links)} broken link(s)"],
+                            "details": video_details,
+                            "broken_links": broken_links,
+                            "selected": False
+                        })
+
+            # Update table
+            self.update_video_table()
+
+            self.show_progress(False)
+            
+            # Always export ALL links to Excel (for filtering)
+            if all_videos_with_links:
+                excel_file = export_all_links_to_excel(all_videos_with_links)
+                self.update_status(
+                    f"✅ Checked {total_links_checked} links ({broken_count} broken, {cached_links} cached). Report: {excel_file}"
+                )
+                if self.videos_needing_update:
+                    self.window["-RESTORE-"].update(disabled=False)
+                # Store for main thread to show popup
+                self._link_check_result = {
+                    "videos": len(all_videos_with_links),
+                    "broken": broken_count,
+                    "links": total_links_checked,
+                    "cached": cached_links,
+                    "file": excel_file
+                }
+            else:
+                self.update_status(
+                    f"✅ No links found in {len(self.videos)} videos"
+                )
+                self._link_check_result = None
+
+        except Exception as e:
+            self.show_progress(False)
+            self.update_status(f"❌ Link check failed: {e}")
 
     def update_selected_videos(self):
         """Update all selected videos."""
@@ -645,13 +908,32 @@ class YouTubeDescriptionEditorGUI:
             if event in (sg.WIN_CLOSED, "-EXIT-"):
                 break
 
-            elif event == "-CONNECT-":
+            # Check for link check result from background thread
+            if self._link_check_result is not None:
+                result = self._link_check_result
+                self._link_check_result = None
+                sg.popup(
+                    f"Link Check Complete!\n\n"
+                    f"Videos with links: {result['videos']}\n"
+                    f"Total links checked: {result['links']}\n"
+                    f"Broken links: {result['broken']}\n"
+                    f"Cached (skipped): {result['cached']}\n\n"
+                    f"Excel report saved to:\n{result['file']}\n\n"
+                    f"Use Excel filters to sort by Status, Privacy, etc.",
+                    title="Links Report"
+                )
+
+            if event == "-CONNECT-":
                 # Run authentication in main thread (needs browser)
                 self.connect_to_youtube()
 
             elif event == "-SEARCH-":
                 # Run search in a thread to keep UI responsive
                 threading.Thread(target=self.search_videos, daemon=True).start()
+
+            elif event == "-CHECK_LINKS-":
+                # Run broken link check in a thread
+                threading.Thread(target=self.check_broken_links, daemon=True).start()
 
             elif event == "-UPDATE-":
                 self.update_selected_videos()

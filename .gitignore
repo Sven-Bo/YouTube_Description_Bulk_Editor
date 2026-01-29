@@ -9,6 +9,9 @@ token.pickle
 # Backup files (contain your video data)
 description_backups.json
 
+# Generated reports
+links_report_*.xlsx
+
 # Python
 __pycache__/
 *.py[cod]

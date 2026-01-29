@@ -7,7 +7,8 @@ A GUI tool to bulk find and replace text patterns in YouTube video descriptions 
 ## Features
 
 - 🔍 **Find & Replace** - Enter any text pattern to find and replace
-- 📋 **Bulk Operations** - Update hundreds of videos at once
+- � **Broken Link Checker** - Find 404/broken links in descriptions (exports to Excel)
+- �📋 **Bulk Operations** - Update hundreds of videos at once
 - 👁️ **Preview Changes** - See before/after comparison before applying
 - ☑️ **Selective Updates** - Choose which videos to update
 - 💾 **Auto Backup** - Automatic backup before each update
@@ -37,3 +38,5 @@ python youtube_description_editor_gui.py
 2. Enter text to **Find** and **Replace with**
 3. Click **Search** to find matching videos
 4. Select videos and click **Update Selected**
+
+Or use **Check 404 Links** to scan all videos for broken links.
